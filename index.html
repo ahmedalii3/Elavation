@@ -1,0 +1,915 @@
+<!DOCTYPE html>
+<!--
+	Exercise 4: Elevation-based color-space visualization with configurable mapping controls.
+
+	This Three.js/WebXR application loads an image or video texture and uses the selected
+	color-space channel as a height map. The user chooses both the color space and the
+	channel through button groups, then controls the elevation strength using a slider.
+
+	Main features:
+	- Supports image and video textures.
+	- Converts sampled RGB colors to RGB, HSV, XYZ, Lab, and LCH.
+	- Uses one selected channel as elevation.
+	- Applies shader-based Lambertian lighting using normals estimated from height differences.
+	- Displays both an elevated shaded surface and a flat reference surface.
+	- Uses button groups instead of dropdown menus for faster interaction.
+	- Supports WebXR/VR with controller rays, controller models, and a 3D HTMLMesh UI.
+	- Uses contentRoot so the visualization can be scaled and repositioned during XR sessions.
+-->
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<title>Three.js Color Elevation Map</title>
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+	<style>
+		/* Basic page layout. Three.js adds the canvas dynamically. */
+		body {
+			margin: 0;
+			overflow: hidden;
+			font-family: Arial, sans-serif;
+			background: #f0f0f0;
+		}
+
+		/* Floating UI panel for color-space, channel, and elevation controls. */
+		#ui {
+			position: absolute;
+			top: 15px;
+			left: 15px;
+			z-index: 10;
+			background: rgba(255,255,255,0.95);
+			padding: 12px 14px;
+			width: 360px;
+			box-sizing: border-box;
+			border-radius: 10px;
+			box-shadow: 0 4px 15px rgba(0,0,0,0.15);
+		}
+
+		/* Section labels inside the UI panel. */
+		#ui label {
+			display: block;
+			margin-top: 8px;
+			font-size: 14px;
+			font-weight: bold;
+		}
+
+		/* Slider styling. */
+		#ui input {
+			margin-top: 4px;
+			width: 180px;
+			padding: 4px;
+			font-size: 14px;
+		}
+
+		/* Button container used for color-space and channel choices. */
+		.button-group {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 6px;
+			margin-top: 6px;
+			width: 100%;
+		}
+
+		/* Default button appearance. */
+		.button-group button {
+			padding: 4px 8px;
+			border: 1px solid #888;
+			border-radius: 6px;
+			background: #f5f5f5;
+			cursor: pointer;
+			font-size: 13px;
+		}
+
+		/* Highlight for the currently selected color space/channel. */
+		.button-group button.active {
+			background: #dce9ff;
+			border-color: #4f7ddf;
+		}
+	</style>
+</head>
+
+<body>
+
+	<!-- Main DOM UI. This same element is converted into an HTMLMesh for XR use. -->
+	<div id="ui">
+		<label>Color Space</label>
+		<div id="colorSpaceButtons" class="button-group"></div>
+
+		<label>Channel</label>
+		<div id="channelButtons" class="button-group"></div>
+
+		<label for="scaleElevation">Elevation Scale</label>
+		<input type="range" id="scaleElevation" min="0" max="3" step="0.01" value="1.0">
+	</div>
+
+	<!--
+		Vertex shader for the elevation surface.
+
+		For each vertex:
+		1. The texture color is sampled using the vertex UV coordinate.
+		2. The selected color-space conversion is applied.
+		3. The selected channel is extracted.
+		4. The vertex is displaced along the local z-axis by that channel value.
+	-->
+	<script type="x-shader/x-vertex" id="elevationVertexShader">
+		varying vec2 vUv;
+		varying vec3 vColor;
+
+		uniform sampler2D tex;
+		uniform float scaleElevation;
+		uniform int colorSpace;
+		uniform int channel;
+
+		// ----------------------------
+		// Color space conversion utils
+		// ----------------------------
+
+		// Converts nonlinear sRGB to linear RGB.
+		vec3 srgbToLinear(vec3 c) {
+			vec3 cutoff = step(vec3(0.04045), c);
+			vec3 lower = c / 12.92;
+			vec3 higher = pow((c + 0.055) / 1.055, vec3(2.4));
+			return mix(lower, higher, cutoff);
+		}
+
+		// Converts RGB to HSV. H, S, and V are normalized for display/elevation.
+		vec3 rgbToHsv(vec3 c) {
+			vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
+			vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+			vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+
+			float d = q.x - min(q.w, q.y);
+			float e = 1.0e-10;
+			return vec3(
+				abs(q.z + (q.w - q.y) / (6.0 * d + e)),
+				d / (q.x + e),
+				q.x
+			);
+		}
+
+		// Converts RGB to CIEXYZ using linear RGB and the D65 sRGB matrix.
+		vec3 rgbToXyz(vec3 c) {
+			c = srgbToLinear(c);
+
+			float X = 0.4124564 * c.r + 0.3575761 * c.g + 0.1804375 * c.b;
+			float Y = 0.2126729 * c.r + 0.7151522 * c.g + 0.0721750 * c.b;
+			float Z = 0.0193339 * c.r + 0.1191920 * c.g + 0.9503041 * c.b;
+
+			return vec3(X, Y, Z);
+		}
+
+		// Helper function for CIELAB conversion.
+		float fLab(float t) {
+			float delta = 6.0 / 29.0;
+			if (t > pow(delta, 3.0)) {
+				return pow(t, 1.0 / 3.0);
+			} else {
+				return t / (3.0 * delta * delta) + 4.0 / 29.0;
+			}
+		}
+
+		// Converts CIEXYZ to CIELAB using a D65 white point.
+		vec3 xyzToLab(vec3 xyz) {
+			// D65 white point
+			vec3 white = vec3(0.95047, 1.0, 1.08883);
+
+			float fx = fLab(xyz.x / white.x);
+			float fy = fLab(xyz.y / white.y);
+			float fz = fLab(xyz.z / white.z);
+
+			float L = 116.0 * fy - 16.0;
+			float a = 500.0 * (fx - fy);
+			float b = 200.0 * (fy - fz);
+
+			return vec3(L, a, b);
+		}
+
+		// Converts CIELAB to CIELCH.
+		vec3 labToLch(vec3 lab) {
+			float L = lab.x;
+			float C = sqrt(lab.y * lab.y + lab.z * lab.z);
+			float H = degrees(atan(lab.z, lab.y));
+			if (H < 0.0) H += 360.0;
+			return vec3(L, C, H);
+		}
+
+		// Extracts the selected channel from the selected color space.
+		float getChannelValue(vec3 rgb, int space, int ch) {
+			if (space == 0) {
+				// RGB
+				if (ch == 0) return rgb.r;
+				if (ch == 1) return rgb.g;
+				return rgb.b;
+			}
+
+			if (space == 1) {
+				// HSV
+				vec3 hsv = rgbToHsv(rgb);
+				if (ch == 0) return hsv.x; // H in [0,1]
+				if (ch == 1) return hsv.y; // S
+				return hsv.z;              // V
+			}
+
+			if (space == 2) {
+				// XYZ
+				vec3 xyz = rgbToXyz(rgb);
+				if (ch == 0) return xyz.x;
+				if (ch == 1) return xyz.y;
+				return xyz.z;
+			}
+
+			if (space == 3) {
+				// Lab
+				vec3 xyz = rgbToXyz(rgb);
+				vec3 lab = xyzToLab(xyz);
+
+				// Normalization for display/elevation
+				if (ch == 0) return lab.x / 100.0;          // L in [0,100]
+				if (ch == 1) return (lab.y + 128.0) / 255.0; // a approx [-128,127]
+				return (lab.z + 128.0) / 255.0;              // b approx [-128,127]
+			}
+
+			// LCH
+			vec3 xyz = rgbToXyz(rgb);
+			vec3 lab = xyzToLab(xyz);
+			vec3 lch = labToLch(lab);
+
+			if (ch == 0) return lch.x / 100.0;   // L
+			if (ch == 1) return clamp(lch.y / 150.0, 0.0, 1.0); // C normalized roughly
+			return lch.z / 360.0; // H normalized
+		}
+
+		void main() {
+			vUv = uv;
+
+			// Sample the media texture at this vertex.
+			vec3 rgb = texture2D(tex, vUv).rgb;
+			vColor = rgb;
+
+			// Compute height from the selected color-space channel.
+			float h = getChannelValue(rgb, colorSpace, channel);
+
+			// Displace the vertex upward along local z.
+			vec3 tmp = position;
+			tmp.z += h * scaleElevation;
+
+			gl_Position = projectionMatrix * modelViewMatrix * vec4(tmp, 1.0);
+		}
+	</script>
+
+	<!--
+		Fragment shader for shaded rendering.
+
+		The fragment shader estimates normals by sampling the height value around the current UV.
+		This produces surface lighting based on the same color-space channel used for elevation.
+	-->
+	<script type="x-shader/x-fragment" id="elevationFragmentShader">
+		varying vec2 vUv;
+
+		uniform sampler2D tex;
+
+		uniform float scaleElevation;
+
+		uniform int colorSpace;
+
+		uniform int channel;
+
+		// Size of one texture pixel in UV coordinates.
+		uniform vec2 stepPixel;
+
+		// Lighting uniforms for custom Lambertian shading.
+		uniform vec3 lightDirection;
+
+		uniform vec3 lightColor;
+
+		uniform vec3 ambientColor;
+
+		uniform float kd;
+
+		uniform float ka;
+
+		// Same color-conversion helpers are repeated here so the fragment shader can estimate heights.
+		vec3 srgbToLinear(vec3 c) {
+
+			vec3 cutoff = step(vec3(0.04045), c);
+
+			vec3 lower = c / 12.92;
+
+			vec3 higher = pow((c + 0.055) / 1.055, vec3(2.4));
+
+			return mix(lower, higher, cutoff);
+
+		}
+
+		vec3 rgbToHsv(vec3 c) {
+
+			vec4 K = vec4(0.0, -1.0/3.0, 2.0/3.0, -1.0);
+
+			vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+
+			vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+
+			float d = q.x - min(q.w, q.y);
+
+			float e = 1.0e-10;
+
+			return vec3(
+
+				abs(q.z + (q.w - q.y) / (6.0 * d + e)),
+
+				d / (q.x + e),
+
+				q.x
+
+			);
+
+		}
+
+		vec3 rgbToXyz(vec3 c) {
+
+			c = srgbToLinear(c);
+
+			float X = 0.4124564 * c.r + 0.3575761 * c.g + 0.1804375 * c.b;
+
+			float Y = 0.2126729 * c.r + 0.7151522 * c.g + 0.0721750 * c.b;
+
+			float Z = 0.0193339 * c.r + 0.1191920 * c.g + 0.9503041 * c.b;
+
+			return vec3(X, Y, Z);
+
+		}
+
+		float fLab(float t) {
+
+			float delta = 6.0 / 29.0;
+
+			if (t > pow(delta, 3.0)) return pow(t, 1.0 / 3.0);
+
+			return t / (3.0 * delta * delta) + 4.0 / 29.0;
+
+		}
+
+		vec3 xyzToLab(vec3 xyz) {
+
+			vec3 white = vec3(0.95047, 1.0, 1.08883);
+
+			float fx = fLab(xyz.x / white.x);
+
+			float fy = fLab(xyz.y / white.y);
+
+			float fz = fLab(xyz.z / white.z);
+
+			float L = 116.0 * fy - 16.0;
+
+			float a = 500.0 * (fx - fy);
+
+			float b = 200.0 * (fy - fz);
+
+			return vec3(L, a, b);
+
+		}
+
+		vec3 labToLch(vec3 lab) {
+
+			float L = lab.x;
+
+			float C = sqrt(lab.y * lab.y + lab.z * lab.z);
+
+			float H = degrees(atan(lab.z, lab.y));
+
+			if (H < 0.0) H += 360.0;
+
+			return vec3(L, C, H);
+
+		}
+
+		// Returns the selected height channel for the chosen color space.
+		float getChannelValue(vec3 rgb, int space, int ch) {
+
+			if (space == 0) {
+
+				if (ch == 0) return rgb.r;
+
+				if (ch == 1) return rgb.g;
+
+				return rgb.b;
+
+			}
+
+			if (space == 1) {
+
+				vec3 hsv = rgbToHsv(rgb);
+
+				if (ch == 0) return hsv.x;
+
+				if (ch == 1) return hsv.y;
+
+				return hsv.z;
+
+			}
+
+			if (space == 2) {
+
+				vec3 xyz = rgbToXyz(rgb);
+
+				if (ch == 0) return xyz.x;
+
+				if (ch == 1) return xyz.y;
+
+				return xyz.z;
+
+			}
+
+			if (space == 3) {
+
+				vec3 xyz = rgbToXyz(rgb);
+
+				vec3 lab = xyzToLab(xyz);
+
+				if (ch == 0) return lab.x / 100.0;
+
+				if (ch == 1) return (lab.y + 128.0) / 255.0;
+
+				return (lab.z + 128.0) / 255.0;
+
+			}
+
+			vec3 xyz = rgbToXyz(rgb);
+
+			vec3 lab = xyzToLab(xyz);
+
+			vec3 lch = labToLch(lab);
+
+			if (ch == 0) return lch.x / 100.0;
+
+			if (ch == 1) return clamp(lch.y / 150.0, 0.0, 1.0);
+
+			return lch.z / 360.0;
+
+		}
+
+		// Samples the selected height channel at a given UV coordinate.
+		float getHeight(vec2 uvCoord) {
+
+			vec3 rgb = texture2D(tex, uvCoord).rgb;
+
+			float h = getChannelValue(rgb, colorSpace, channel);
+
+			return h * scaleElevation;
+
+		}
+
+		void main() {
+
+			// Base color is still the original texture color.
+			vec3 baseColor = texture2D(tex, vUv).rgb;
+
+			// Sample neighboring heights in UV space.
+			float hL = getHeight(vUv - vec2(stepPixel.x, 0.0));
+
+			float hR = getHeight(vUv + vec2(stepPixel.x, 0.0));
+
+			float hD = getHeight(vUv - vec2(0.0, stepPixel.y));
+
+			float hU = getHeight(vUv + vec2(0.0, stepPixel.y));
+
+			// Estimate local height derivatives using central differences.
+			float dhdu = (hR - hL) / (2.0 * stepPixel.x);
+
+			float dhdv = (hU - hD) / (2.0 * stepPixel.y);
+
+			// Build a normal from the height-field slope.
+			vec3 N = normalize(vec3(-dhdu, -dhdv, 1.0));
+
+			vec3 L = normalize(lightDirection);
+
+			// Lambertian diffuse lighting term.
+			float lambert = max(dot(N, L), 0.0);
+
+			// Combine ambient and diffuse lighting.
+			vec3 lighting = ambientColor * ka + lightColor * kd * lambert;
+
+			vec3 finalColor = baseColor * lighting;
+
+			gl_FragColor = vec4(finalColor, 1.0);
+
+		}
+	</script>
+
+	<!-- ES module shim for import map support. -->
+	<script async src="https://unpkg.com/es-module-shims@1.3.6/dist/es-module-shims.js"></script>
+
+	<!-- Import map for Three.js and its addons, including WebXR helpers. -->
+	<script type="importmap">
+	{
+		"imports": {
+			"three": "https://unpkg.com/three@0.172.0/build/three.module.js",
+"three/addons/": "https://unpkg.com/three@0.172.0/examples/jsm/"
+		}
+	}
+	</script>
+
+	<script type="module">
+		import * as THREE from 'three';
+		import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+		import { BoxLineGeometry } from 'three/addons/geometries/BoxLineGeometry.js';
+		import { VRButton } from 'three/addons/webxr/VRButton.js';
+		import { HTMLMesh } from 'three/addons/interactive/HTMLMesh.js';
+		import { InteractiveGroup } from 'three/addons/interactive/InteractiveGroup.js';
+		import { XRControllerModelFactory } from 'three/addons/webxr/XRControllerModelFactory.js';
+
+		// Main Three.js scene objects.
+		let camera, scene, renderer, controls;
+		let elevationMaterial, flatMaterial;
+		let elevationMesh, flatMesh;
+		let room;
+
+		// Root group for all visualization content and XR UI mesh.
+		let contentRoot, uiMesh;
+
+		// DOM UI references.
+		const colorSpaceButtonsEl = document.getElementById('colorSpaceButtons');
+		const channelButtonsEl = document.getElementById('channelButtons');
+		const scaleSlider = document.getElementById('scaleElevation');
+
+		// Current UI/shader state.
+		let currentColorSpace = 0;
+		let currentChannel = 0;
+
+		// Channel names for each color space.
+		const channelOptions = {
+			0: ['R', 'G', 'B'],
+			1: ['H', 'S', 'V'],
+			2: ['X', 'Y', 'Z'],
+			3: ['L*', 'a*', 'b*'],
+			4: ['L*', 'C*', 'H°']
+		};
+
+		// Color-space button labels.
+		const colorSpaceOptions = ['RGB', 'HSV', 'XYZ', 'Lab', 'LCH'];
+
+		// Start application.
+		init();
+
+		// Loads an image/video source and returns a configured texture plus media metadata.
+		function loadMediaTexture(url, onLoad, onError) {
+				const lower = url.toLowerCase();
+
+				const imageExts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'];
+				const videoExts = ['.mp4', '.webm', '.ogg', '.mov', '.m4v'];
+
+				const isImage = imageExts.some(ext => lower.endsWith(ext));
+				const isVideo = videoExts.some(ext => lower.endsWith(ext));
+
+				// Image path: load normal texture.
+				if (isImage) {
+					const loader = new THREE.TextureLoader();
+					loader.load(
+						url,
+						function(texture) {
+							texture.minFilter = THREE.LinearFilter;
+							texture.magFilter = THREE.LinearFilter;
+							texture.needsUpdate = true;
+
+							onLoad({
+								texture: texture,
+								width: texture.image.width,
+								height: texture.image.height,
+								type: 'image',
+								element: texture.image
+							});
+						},
+						undefined,
+						function(err) {
+							if (onError) onError(err);
+						}
+					);
+					return;
+				}
+
+				// Video path: create HTML video element and wrap it as a VideoTexture.
+				if (isVideo) {
+					const video = document.createElement('video');
+					video.src = url;
+					video.crossOrigin = 'anonymous';
+					video.loop = true;
+					video.muted = true;
+					video.playsInline = true;
+					video.autoplay = true;
+					video.preload = 'auto';
+
+					const onVideoReady = function() {
+						const texture = new THREE.VideoTexture(video);
+						texture.minFilter = THREE.LinearFilter;
+						texture.magFilter = THREE.LinearFilter;
+						texture.generateMipmaps = false;
+						texture.needsUpdate = true;
+
+						onLoad({
+							texture: texture,
+							width: video.videoWidth,
+							height: video.videoHeight,
+							type: 'video',
+							element: video
+						});
+
+						video.play().catch(err => {
+							console.warn('Video play was blocked or failed:', err);
+						});
+					};
+
+					video.addEventListener('loadeddata', onVideoReady, { once: true });
+					video.addEventListener('error', function(err) {
+						if (onError) onError(err);
+					});
+
+					video.load();
+					return;
+				}
+
+				// Unsupported media fallback.
+				if (onError) {
+					onError(new Error('Unsupported file type: ' + url));
+				}
+			}
+
+		// Renders color-space choice buttons and highlights the active option.
+		function renderColorSpaceButtons() {
+			colorSpaceButtonsEl.innerHTML = '';
+			colorSpaceOptions.forEach((name, index) => {
+				const button = document.createElement('button');
+				button.type = 'button';
+				button.textContent = name;
+				button.classList.toggle('active', index === currentColorSpace);
+				button.addEventListener('click', () => updateColorSpace(index));
+				colorSpaceButtonsEl.appendChild(button);
+			});
+		}
+
+		// Renders channel buttons for the currently selected color space.
+		function renderChannelButtons() {
+			channelButtonsEl.innerHTML = '';
+			channelOptions[currentColorSpace].forEach((name, index) => {
+				const button = document.createElement('button');
+				button.type = 'button';
+				button.textContent = name;
+				button.classList.toggle('active', index === currentChannel);
+				button.addEventListener('click', () => updateChannel(index));
+				channelButtonsEl.appendChild(button);
+			});
+		}
+
+		// Updates selected color space and pushes that state into shader uniforms.
+		function updateColorSpace(value) {
+			currentColorSpace = value;
+			currentChannel = 0;
+			renderColorSpaceButtons();
+			renderChannelButtons();
+			if (elevationMaterial) {
+				elevationMaterial.uniforms.colorSpace.value = currentColorSpace;
+				elevationMaterial.uniforms.channel.value = currentChannel;
+			}
+		}
+
+		// Updates the selected channel and applies it to elevation shading uniforms.
+		function updateChannel(value) {
+			currentChannel = value;
+			renderChannelButtons();
+			if (elevationMaterial) {
+				elevationMaterial.uniforms.channel.value = currentChannel;
+			}
+		}
+
+		// Initializes scene content, media geometry, UI wiring, and XR render loop.
+		function init() {
+			scene = new THREE.Scene();
+			scene.background = new THREE.Color(0xffffff);
+
+			// All scene visualization objects are grouped for easy XR transform control.
+			contentRoot = new THREE.Group();
+			scene.add(contentRoot);
+
+			camera = new THREE.PerspectiveCamera(
+				60,
+				window.innerWidth / window.innerHeight,
+				0.1,
+				100
+			);
+			camera.position.set(2, 5, 8);
+
+			// Standard lights for helper objects such as the base and room.
+			const light = new THREE.DirectionalLight(0xffffff, 1.2);
+			light.position.set(10, 7, 5);
+			scene.add(light);
+
+			const ambient = new THREE.AmbientLight(0xffffff, 0.5);
+			scene.add(ambient);
+
+			// Wireframe room for spatial reference.
+			room = new THREE.LineSegments(
+				new BoxLineGeometry(20, 10, 20, 20, 10, 20),
+				new THREE.LineBasicMaterial({ color: 0x888888 })
+			);
+			contentRoot.add(room);
+
+			// Grey base platform below the elevation and flat reference maps.
+			const baseGeometry = new THREE.BoxGeometry(5, 0.4, 5, 10, 2, 10);
+			const baseMaterial = new THREE.MeshStandardMaterial({
+				color: 0xdddddd,
+				roughness: 1.0,
+				metalness: 0.0
+			});
+			const base = new THREE.Mesh(baseGeometry, baseMaterial);
+			base.position.y = -2;
+			contentRoot.add(base);
+
+			// Load the media texture and build the elevated/flat meshes.
+			loadMediaTexture('grenouille-gaus.jpg', function(media) {
+                const texture = media.texture;
+                const width = media.width;
+                const height = media.height;
+
+                const scale = 4.0;
+                const discret = 2;
+                const factor = height / width;
+
+                // Plane geometry is subdivided based on image resolution.
+                const planeGeometry = new THREE.PlaneGeometry(
+                    scale,
+                    scale * factor,
+                    Math.floor(width / discret),
+                    Math.floor(height / discret)
+                );
+
+                // Shader material for the elevated and shaded surface.
+                elevationMaterial = new THREE.ShaderMaterial({
+                    vertexShader: document.querySelector('#elevationVertexShader').textContent.trim(),
+                    fragmentShader: document.querySelector('#elevationFragmentShader').textContent.trim(),
+                    side: THREE.DoubleSide,
+                    uniforms: {
+					tex: { value: texture },
+					scaleElevation: { value: parseFloat(scaleSlider.value) },
+					colorSpace: { value: currentColorSpace },
+					channel: { value: currentChannel },
+
+					// UV distance between neighboring pixels for finite-difference normal estimation.
+					stepPixel: {
+						value: new THREE.Vector2(
+							1.0 / width,
+							1.0 / height
+						)
+					},
+
+					// Lighting values used by the fragment shader.
+					lightDirection: {
+						value: new THREE.Vector3(0.6, 0.6, 1.0).normalize()
+					},
+
+					lightColor: {
+						value: new THREE.Vector3(1.0, 1.0, 1.0)
+					},
+
+					ambientColor: {
+						value: new THREE.Vector3(1.0, 1.0, 1.0)
+					},
+
+					// Diffuse and ambient lighting strengths.
+					kd: { value: 0.9 },
+					ka: { value: 0.25 }
+				}
+                });
+
+                elevationMesh = new THREE.Mesh(planeGeometry, elevationMaterial);
+                elevationMesh.position.y = -0.7;
+                elevationMesh.rotation.x = -Math.PI / 2;
+                elevationMesh.rotation.z = Math.PI;
+                contentRoot.add(elevationMesh);
+
+                // Flat reference mesh using the same texture but without displacement.
+                flatMaterial = new THREE.MeshBasicMaterial({
+                    map: texture,
+                    side: THREE.DoubleSide
+                });
+
+                flatMesh = new THREE.Mesh(planeGeometry, flatMaterial);
+                flatMesh.position.y = -1.5;
+                flatMesh.rotation.x = -Math.PI / 2;
+                flatMesh.rotation.z = Math.PI;
+                contentRoot.add(flatMesh);
+            }, function(err) {
+                console.error('Media load failed:', err);
+            });
+
+			
+
+			// Renderer setup with WebXR enabled.
+			renderer = new THREE.WebGLRenderer({ antialias: true });
+			renderer.setPixelRatio(window.devicePixelRatio);
+			renderer.setSize(window.innerWidth, window.innerHeight);
+			renderer.xr.enabled = true;
+			renderer.setAnimationLoop(render);
+			document.body.appendChild(renderer.domElement);
+			document.body.appendChild(VRButton.createButton(renderer));
+
+			// Desktop camera controls.
+			controls = new OrbitControls(camera, renderer.domElement);
+			controls.enableDamping = true;
+			controls.dampingFactor = 0.05;
+			controls.screenSpacePanning = true;
+			controls.minDistance = 1;
+			controls.maxDistance = 50;
+			controls.target.set(0, -1.0, 0);
+			controls.update();
+
+			// Build initial UI buttons.
+			renderColorSpaceButtons();
+			renderChannelButtons();
+
+			// Add XR controllers and XR UI panel.
+			setupXRUI();
+
+			// Update elevation scale uniform when slider changes.
+			scaleSlider.addEventListener('input', () => {
+				if (elevationMaterial) {
+					elevationMaterial.uniforms.scaleElevation.value = parseFloat(scaleSlider.value);
+				}
+			});
+
+			window.addEventListener('resize', onWindowResize);
+		}
+
+		// Creates XR controller interaction and displays the UI panel in headset sessions.
+		function setupXRUI() {
+			// Visible controller ray used for pointing at the UI.
+			const rayGeometry = new THREE.BufferGeometry().setFromPoints([
+				new THREE.Vector3(0, 0, 0),
+				new THREE.Vector3(0, 0, -5)
+			]);
+
+			const controller1 = renderer.xr.getController(0);
+			controller1.add(new THREE.Line(rayGeometry));
+			scene.add(controller1);
+
+			const controller2 = renderer.xr.getController(1);
+			controller2.add(new THREE.Line(rayGeometry));
+			scene.add(controller2);
+
+			// Add visual controller models to the XR controller grips.
+			const controllerModelFactory = new XRControllerModelFactory();
+
+			const controllerGrip1 = renderer.xr.getControllerGrip(0);
+			controllerGrip1.add(controllerModelFactory.createControllerModel(controllerGrip1));
+			scene.add(controllerGrip1);
+
+			const controllerGrip2 = renderer.xr.getControllerGrip(1);
+			controllerGrip2.add(controllerModelFactory.createControllerModel(controllerGrip2));
+			scene.add(controllerGrip2);
+
+			// InteractiveGroup routes pointer/controller events to the HTMLMesh.
+			const group = new InteractiveGroup();
+			group.listenToPointerEvents(renderer, camera);
+			group.listenToXRControllerEvents(controller1);
+			group.listenToXRControllerEvents(controller2);
+			scene.add(group);
+
+			// Convert the DOM UI panel into a 3D object for VR interaction.
+			uiMesh = new HTMLMesh(document.getElementById('ui'));
+			uiMesh.position.set(-0.95, 1.1, -0.8);
+			uiMesh.rotation.y = Math.PI / 4;
+			uiMesh.scale.setScalar(1.5);
+			uiMesh.visible = false;
+			group.add(uiMesh);
+
+			// In XR, show UI and bring the content closer/smaller for comfortable viewing.
+			renderer.xr.addEventListener('sessionstart', () => {
+				uiMesh.visible = true;
+				controls.enabled = false;
+				contentRoot.scale.setScalar(0.45);
+				contentRoot.position.set(0, -0.15, -0.9);
+			});
+
+			// Restore desktop interaction when XR ends.
+			renderer.xr.addEventListener('sessionend', () => {
+				uiMesh.visible = false;
+				controls.enabled = true;
+				contentRoot.scale.setScalar(1.0);
+				contentRoot.position.set(0, 0, 0);
+			});
+		}
+
+		// Keeps the camera and renderer dimensions synchronized with window size.
+		function onWindowResize() {
+			camera.aspect = window.innerWidth / window.innerHeight;
+			camera.updateProjectionMatrix();
+			renderer.setSize(window.innerWidth, window.innerHeight);
+		}
+
+		// Renders each frame, including OrbitControls and XR HTML UI refresh.
+		function render() {
+			controls.update();
+			if (uiMesh && uiMesh.visible) uiMesh.material.map.update();
+			renderer.render(scene, camera);
+		}
+	</script>
+</body>
+</html>
